@@ -1,16 +1,7 @@
-"""
-Step 2: a small backend that serves the saved model as an API.
-
-Run on your own computer:   uvicorn main:app --reload
-Then open in a browser:     http://127.0.0.1:8000/docs
-
-Endpoints
-  GET /                          is the API running? what model is loaded?
-  GET /predict?lag_1=..&lag_2=.. predict from two prices you type in
-  GET /predict/live?symbol=TSLA  fetch the latest prices from Alpha Vantage, then predict
-"""
 import json
 import os
+import time
+from datetime import datetime, timezone
 
 import joblib
 import pandas as pd
@@ -32,10 +23,95 @@ app = FastAPI(
 # Allow web pages on other addresses (any frontend) to call this API
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"])
 
+# Closes only change once a day, so there is no reason to hit the provider
+# on every request. Keyed by symbol -> (fetched_at, quote).
+CACHE_TTL = 900  # seconds
+_cache: dict[str, tuple[float, dict]] = {}
+
 
 def predict_next(lag_1: float, lag_2: float) -> float:
     X = pd.DataFrame({"lag_1": [lag_1], "lag_2": [lag_2]})
     return round(float(model.predict(X)[0]), 2)
+
+
+def _fetch_finnhub(symbol: str, key: str) -> dict:
+    """Finnhub /quote: 60 calls/minute on the free tier, no daily cap."""
+    reply = requests.get(
+        "https://finnhub.io/api/v1/quote",
+        params={"symbol": symbol, "token": key},
+        timeout=15,
+    ).json()
+
+    if not reply.get("c"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"No quote found for symbol '{symbol}'. Provider said: {reply}",
+        )
+
+    day = None
+    if reply.get("t"):
+        day = datetime.fromtimestamp(reply["t"], tz=timezone.utc).date().isoformat()
+
+    return {
+        "symbol": symbol,
+        "latest_trading_day": day,
+        "last_close": float(reply["c"]),
+        "previous_close": float(reply["pc"]),
+        "source": "finnhub",
+    }
+
+
+def _fetch_alphavantage(symbol: str, key: str) -> dict:
+    """Fallback. Free tier is 25 requests/day AND rate limited per IP, so this
+    works from a laptop but usually fails from a shared cloud host."""
+    reply = requests.get(
+        "https://www.alphavantage.co/query",
+        params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": key},
+        timeout=15,
+    ).json()
+
+    quote = reply.get("Global Quote")
+    if not quote:
+        raise HTTPException(
+            status_code=502,
+            detail=f"No quote found for symbol '{symbol}'. Provider said: {reply}",
+        )
+
+    return {
+        "symbol": quote["01. symbol"],
+        "latest_trading_day": quote["07. latest trading day"],
+        "last_close": float(quote["05. price"]),
+        "previous_close": float(quote["08. previous close"]),
+        "source": "alphavantage",
+    }
+
+
+def fetch_quote(symbol: str) -> dict:
+    symbol = symbol.upper().strip()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol must not be empty.")
+
+    now = time.time()
+    cached = _cache.get(symbol)
+    if cached and now - cached[0] < CACHE_TTL:
+        return {**cached[1], "cached": True}
+
+    finnhub_key = os.environ.get("FINNHUB_KEY")
+    alpha_key = os.environ.get("ALPHAVANTAGE_KEY")
+
+    if finnhub_key:
+        quote = _fetch_finnhub(symbol, finnhub_key)
+    elif alpha_key:
+        quote = _fetch_alphavantage(symbol, alpha_key)
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="No data provider configured. Set FINNHUB_KEY (preferred) "
+            "or ALPHAVANTAGE_KEY on the server.",
+        )
+
+    _cache[symbol] = (now, quote)
+    return {**quote, "cached": False}
 
 
 @app.get("/")
@@ -56,33 +132,12 @@ def predict(lag_1: float, lag_2: float):
 
 @app.get("/predict/live")
 def predict_live(symbol: str = "TSLA"):
-    """Get the latest two closes from Alpha Vantage, then predict the next one."""
-    key = os.environ.get("ALPHAVANTAGE_KEY")
-    if not key:
-        raise HTTPException(status_code=500, detail="ALPHAVANTAGE_KEY is not set on the server.")
-
-    reply = requests.get(
-        "https://www.alphavantage.co/query",
-        params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": key},
-        timeout=15,
-    ).json()
-
-    quote = reply.get("Global Quote")
-    if not quote:
-        # Alpha Vantage answered with a message (bad key, daily limit, unknown symbol...).
-        # We pass it on with a proper error status code.
-        message = reply if "Global Quote" not in reply else f"No quote found for symbol '{symbol}'."
-        raise HTTPException(status_code=502, detail=message)
-
-    last_close = float(quote["05. price"])
-    previous_close = float(quote["08. previous close"])
+    """Get the latest two closes from the data provider, then predict the next one."""
+    quote = fetch_quote(symbol)
     return {
-        "symbol": quote["01. symbol"],
-        "latest_trading_day": quote["07. latest trading day"],
-        "last_close": last_close,
-        "previous_close": previous_close,
-        "predicted_next_close": predict_next(last_close, previous_close),
-        "naive_forecast": last_close,
+        **quote,
+        "predicted_next_close": predict_next(quote["last_close"], quote["previous_close"]),
+        "naive_forecast": quote["last_close"],
         "model": info["model"],
         "trained_on": info["trained_on"],
     }
